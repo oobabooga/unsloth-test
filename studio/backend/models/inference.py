@@ -2407,7 +2407,12 @@ class ChatCompletionRequest(BaseModel):
         ``thinking`` shapes are rejected at validation time (422).
         """
         if self.thinking is not None and self.enable_thinking is None:
-            self.enable_thinking = self.thinking.type == "enabled"
+            # Derived, not an explicit x-unsloth override: keep it out of
+            # model_fields_set so route precedence still ranks it below the nested
+            # controls. The discard also covers a client sending an explicit null,
+            # which pydantic records as set.
+            object.__setattr__(self, "enable_thinking", self.thinking.type == "enabled")
+            self.model_fields_set.discard("enable_thinking")
         return self
 
     @field_validator("permission_mode", mode = "before")
