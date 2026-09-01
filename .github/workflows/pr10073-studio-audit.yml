@@ -1,0 +1,142 @@
+name: "PR 10073 studio audit"
+
+on:
+  push:
+    branches: [pr-10073-ci]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: pr10073-audit-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # The decisive one: production launches studio/setup.ps1 through powershell.exe
+  # (Windows PowerShell 5.1), never pwsh 7, so the binder that drops -d must be the 5.1 one.
+  windows-powershell-51:
+    runs-on: windows-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - name: Host identity
+        shell: powershell
+        run: |
+          $PSVersionTable | Format-List
+          "common parameters on this host:"
+          [System.Management.Automation.Internal.CommonParameters].GetProperties().Name -join ', '
+      - name: Binder probe on the wrappers' exact parameter block
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Stop'
+          function Probe { param([Parameter(ValueFromRemainingArguments=$true)]$Args_) ,@($Args_) }
+          $short = Probe --no-deps --only-binary=:all: -d 'C:\tmp\stage' 'triton-xpu==3.6.0' --index-url 'https://example.invalid/xpu'
+          $long  = Probe --no-deps --only-binary=:all: --dest 'C:\tmp\stage' 'triton-xpu==3.6.0' --index-url 'https://example.invalid/xpu'
+          "short form reached: $($short.Count)/7 -> $($short -join ' ')"
+          "long  form reached: $($long.Count)/7 -> $($long -join ' ')"
+          if ($short -contains '-d') { throw "5.1 did NOT swallow -d; the premise of the fix is wrong on this host" }
+          if ($short.Count -ne 6) { throw "unexpected short-form arity: $($short.Count)" }
+          if (-not ($long -contains '--dest')) { throw "5.1 did NOT forward --dest; the fix does not work on this host" }
+          if ($long.Count -ne 7) { throw "unexpected long-form arity: $($long.Count)" }
+          "OK: -d swallowed, --dest forwarded, under $($PSVersionTable.PSVersion)"
+      - name: The real Fast-Download, dot-sourced from studio/setup.ps1
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Stop'
+          . .\tests\studio_setup_ps1\Get-FunctionSource.ps1
+          $src = Get-FunctionSource -Path .\studio\setup.ps1 -Name 'Fast-Download'
+          if (-not $src) { throw "Fast-Download not found in studio/setup.ps1" }
+          . ([scriptblock]::Create($src))
+          function global:python { $global:PipArgs = @($args); '' }
+          $global:PipArgs = @()
+          Fast-Download --no-deps --only-binary=:all: --dest 'C:\tmp\stage' 'triton-xpu==3.6.0' --index-url 'https://example.invalid/xpu' | Out-Null
+          "argv pip receives: $($global:PipArgs -join ' ')"
+          if (-not ($global:PipArgs -contains '--dest')) { throw "--dest never reached pip" }
+          $i = [array]::IndexOf($global:PipArgs, '--dest')
+          if ($global:PipArgs[$i + 1] -ne 'C:\tmp\stage') { throw "the directory is not adjacent to --dest" }
+          if ((($global:PipArgs[0..2]) -join ' ') -ne '-m pip download') { throw "not a pip download invocation" }
+          "OK: the shipped wrapper forwards --dest to pip under Windows PowerShell 5.1"
+      - name: The real call sites, lifted verbatim out of studio/setup.ps1
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Stop'
+          . .\tests\studio_setup_ps1\Get-FunctionSource.ps1
+          . ([scriptblock]::Create((Get-FunctionSource -Path .\studio\setup.ps1 -Name 'Fast-Download')))
+          $lines = Get-Content -LiteralPath .\studio\setup.ps1
+          $calls = @($lines | Where-Object { $_ -match 'Fast-Download' -and $_ -notmatch '^\s*#' -and $_ -notmatch '^\s*function' })
+          if ($calls.Count -ne 2) { throw "expected 2 Fast-Download call sites, found $($calls.Count)" }
+          $script:UnslothVerbose = $false
+          $_tritonTmp     = 'C:\tmp\unsloth_triton_xpu_0da4251b'
+          $_tritonXpuSpec = 'triton-xpu==3.6.0'
+          $XpuIndexUrl    = 'https://example.invalid/xpu'
+          function Redact-InstallOutput { param($t) $t }
+          foreach ($line in $calls) {
+              function global:python { $global:PipArgs = @($args); '' }
+              $global:PipArgs = @()
+              Invoke-Expression $line.Trim() | Out-Null
+              "call site -> $($global:PipArgs -join ' ')"
+              if (-not ($global:PipArgs -contains '--dest')) { throw "a shipped call site still loses the destination" }
+              $i = [array]::IndexOf($global:PipArgs, '--dest')
+              if ($global:PipArgs[$i + 1] -ne $_tritonTmp) { throw "destination not adjacent at a shipped call site" }
+          }
+          "OK: both shipped call sites reach pip with --dest under Windows PowerShell 5.1"
+
+  # Parity with upstream CI, which runs this suite under pwsh 7.
+  windows-pester-pwsh7:
+    runs-on: windows-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Pester
+        shell: pwsh
+        run: |
+          if (-not (Get-PSRepository -Name PSGallery -ErrorAction SilentlyContinue)) { Register-PSRepository -Default -ErrorAction SilentlyContinue }
+          Set-PSRepository PSGallery -InstallationPolicy Trusted -ErrorAction SilentlyContinue
+          Install-Module Pester -MinimumVersion 5.5.0 -Force -Scope CurrentUser
+      - name: Run the setup.ps1 Pester suite
+        shell: pwsh
+        run: |
+          $cfg = New-PesterConfiguration
+          $cfg.Run.Path = 'tests/studio_setup_ps1'
+          $cfg.Run.Exit = $true
+          $cfg.Run.Throw = $true
+          $cfg.Output.Verbosity = 'Detailed'
+          Invoke-Pester -Configuration $cfg
+
+  # Representative unaffected platforms: the change is Windows-only, so the Linux/macOS
+  # installer paths and the manifest surfaces must be untouched.
+  unaffected-platforms:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-15]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install test deps
+        run: python -m pip install -q pytest
+      - name: Linux/macOS installer + manifest + XPU-swap tests
+        env:
+          UNSLOTH_IS_PRESENT: '1'
+          UNSLOTH_COMPILE_DISABLE: '1'
+        run: |
+          python -m pytest -q \
+            tests/studio/test_xpu_triton_swap.py \
+            tests/test_studio_install_workspace_guard.py \
+            tests/studio/install/test_install_manifest.py \
+            tests/studio/install/test_install_manifest_damage.py \
+            tests/studio/install/test_setup_fast_path_guard.py
+      - name: Deterministic routing - setup.ps1 is never selected off Windows
+        run: |
+          python - <<'PY'
+          import platform, pathlib, re
+          src = pathlib.Path('unsloth_cli/commands/studio.py').read_text()
+          hits = re.findall(r'name = "setup\.ps1" if platform\.system\(\) == "Windows" else "setup\.sh"', src)
+          assert len(hits) >= 2, hits
+          assert platform.system() != 'Windows'
+          print(f'{platform.system()}: setup script selected = setup.sh, setup.ps1 unreachable ({len(hits)} guarded sites)')
+          PY
