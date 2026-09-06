@@ -26,7 +26,7 @@ jobs:
         with:
           python-version: "3.12"
 
-      - name: Install the backend import deps (no torch: the policy tests are torch-free)
+      - name: "Install the backend import deps (no torch; the policy tests are torch-free)"
         shell: bash
         run: |
           python -m pip install --upgrade pip
@@ -34,12 +34,12 @@ jobs:
                       python-jose passlib bcrypt "huggingface_hub>=0.30" pyyaml \
                       python-multipart email-validator aiosqlite sqlalchemy psutil requests
 
-      - name: The PR's own policy tests
+      - name: "The PR own policy tests"
         shell: bash
         working-directory: studio/backend
         run: python -m pytest tests/test_hub_write_ambient_token.py tests/test_mcp_server.py -q
 
-      - name: Deterministic routing check (no OS branch, sentinel is platform-independent)
+      - name: "Deterministic routing check"
         shell: bash
         working-directory: studio/backend
         run: |
@@ -93,26 +93,40 @@ jobs:
               fails.append("None must inherit the ambient env, not scrub it")
 
           # 4. huggingface_hub must honour the scrub on THIS OS + this hub version.
-          import os, huggingface_hub
-          for k in ("HF_TOKEN", "HF_HUB_TOKEN", "HUGGING_FACE_HUB_TOKEN",
-                    "HUGGINGFACEHUB_API_TOKEN", "HUGGINGFACE_HUB_TOKEN"):
-              os.environ.pop(k, None)
-          os.environ["HF_TOKEN"] = "hf_OPERATOR_CANARY"
-          apply_token_to_child_env(os.environ, False)
-          import importlib
-          importlib.reload(huggingface_hub.constants)
-          from huggingface_hub.utils import build_hf_headers
-          hdr = build_hf_headers().get("authorization")
-          if hdr is not None:
-              fails.append(f"implicit token still attached after the scrub: {hdr}")
+          #    In a CHILD, because the constant is read once at import, which is exactly
+          #    how the export worker applies it.
+          import os, subprocess, sys as _sys
+          child = (
+              "import os, huggingface_hub;"
+              "from huggingface_hub.utils import build_hf_headers;"
+              "print(huggingface_hub.__version__, repr(build_hf_headers().get('authorization')))"
+          )
+          env = dict(os.environ)
+          env["HF_TOKEN"] = "hf_OPERATOR_CANARY"
+          env.pop("HF_HUB_DISABLE_IMPLICIT_TOKEN", None)
+          apply_token_to_child_env(env, False)
+          out = subprocess.run([_sys.executable, "-c", child], capture_output=True,
+                               text=True, env=env).stdout.strip()
+          print("child under the scrub ->", out)
+          if "None" not in out.split(" ", 1)[-1]:
+              fails.append(f"implicit token still attached after the scrub: {out}")
 
-          print("huggingface_hub", huggingface_hub.__version__, "| implicit header after scrub:", hdr)
+          env2 = dict(os.environ)
+          env2["HF_TOKEN"] = "hf_OPERATOR_CANARY"
+          env2.pop("HF_HUB_DISABLE_IMPLICIT_TOKEN", None)
+          out2 = subprocess.run([_sys.executable, "-c", child], capture_output=True,
+                                text=True, env=env2).stdout.strip()
+          print("child WITHOUT the scrub ->", out2)
+          if "hf_OPERATOR_CANARY" not in out2:
+              fails.append("control failed: an unscrubbed child did not attach the ambient token, "
+                           "so the scrub assertion above proves nothing")
+
           if fails:
               print("FAILURES:"); [print("  -", f) for f in fails]; raise SystemExit(1)
           print("OK: token policy is identical on this OS")
           PY
 
-      - name: Export routes carry no OS branch
+      - name: "Export routes carry no OS branch"
         shell: bash
         working-directory: studio/backend
         run: |
