@@ -1,0 +1,135 @@
+name: "PR10142 hub-token policy matrix"
+
+on:
+  push:
+    branches: [pr-10142-ci]
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: pr10142-token-policy-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  policy:
+    name: "token policy (${{ matrix.os }})"
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-14, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install the backend import deps (no torch: the policy tests are torch-free)
+        shell: bash
+        run: |
+          python -m pip install --upgrade pip
+          pip install pytest fastapi "uvicorn[standard]" httpx pydantic structlog \
+                      python-jose passlib bcrypt "huggingface_hub>=0.30" pyyaml \
+                      python-multipart email-validator aiosqlite sqlalchemy psutil requests
+
+      - name: The PR's own policy tests
+        shell: bash
+        working-directory: studio/backend
+        run: python -m pytest tests/test_hub_write_ambient_token.py tests/test_mcp_server.py -q
+
+      - name: Deterministic routing check (no OS branch, sentinel is platform-independent)
+        shell: bash
+        working-directory: studio/backend
+        run: |
+          python - <<'PY'
+          import ast, pathlib, sys
+          fails = []
+
+          # 1. hf_token_arg / normalize_token / is_anonymous must be pure and OS-independent.
+          src = pathlib.Path("hub/utils/hf_tokens.py").read_text()
+          tree = ast.parse(src)
+          banned = ("platform", "sys.platform", "os.name", "uname")
+          for n in ast.walk(tree):
+              if isinstance(n, ast.Attribute) and n.attr in ("platform", "name", "uname"):
+                  fails.append(f"hf_tokens.py has a platform branch at line {n.lineno}")
+
+          # 2. The sentinel decision table, evaluated on THIS OS.
+          sys.path.insert(0, ".")
+          from hub.utils.hf_tokens import hf_token_arg, normalize_token, is_anonymous
+          table = {
+              (None, True): None, (None, False): False,
+              ("", True): None, ("", False): False,
+              ("  ", True): None, ("  ", False): False,
+              ("tok", True): "tok", ("tok", False): "tok",
+              (" tok ", True): "tok", (" tok ", False): "tok",
+          }
+          for (tok, ambient), want in table.items():
+              got = hf_token_arg(tok, allow_ambient_token=ambient)
+              if got is not want and got != want:
+                  fails.append(f"hf_token_arg({tok!r}, ambient={ambient}) -> {got!r}, want {want!r}")
+          if normalize_token(False) is not False: fails.append("normalize_token(False) laundered")
+          if normalize_token(None) is not None: fails.append("normalize_token(None) changed")
+          if normalize_token("") is not None: fails.append("normalize_token('') changed")
+          if not is_anonymous(False) or is_anonymous(None) or is_anonymous(""):
+              fails.append("is_anonymous is not exactly `is False`")
+
+          # 3. The env scrub, evaluated on THIS OS.
+          from hub.utils.hf_tokens import apply_token_to_child_env
+          env = {"HF_TOKEN": "op", "HF_HUB_TOKEN": "op2", "HUGGINGFACEHUB_API_TOKEN": "op3"}
+          apply_token_to_child_env(env, False)
+          if env.get("HF_TOKEN") or env.get("HF_HUB_TOKEN") or env.get("HUGGINGFACEHUB_API_TOKEN"):
+              fails.append(f"anonymous scrub left a credential: {env}")
+          if env.get("HF_HUB_DISABLE_IMPLICIT_TOKEN") != "1":
+              fails.append("anonymous scrub did not disable the implicit token")
+          env2 = {"HF_TOKEN": "op", "HF_HUB_TOKEN": "op2"}
+          apply_token_to_child_env(env2, "caller")
+          if env2.get("HF_TOKEN") != "caller" or env2.get("HF_HUB_TOKEN") is not None:
+              fails.append(f"caller grant left an operator alias: {env2}")
+          env3 = {"HF_TOKEN": "op"}
+          apply_token_to_child_env(env3, None)
+          if env3.get("HF_TOKEN") != "op":
+              fails.append("None must inherit the ambient env, not scrub it")
+
+          # 4. huggingface_hub must honour the scrub on THIS OS + this hub version.
+          import os, huggingface_hub
+          for k in ("HF_TOKEN", "HF_HUB_TOKEN", "HUGGING_FACE_HUB_TOKEN",
+                    "HUGGINGFACEHUB_API_TOKEN", "HUGGINGFACE_HUB_TOKEN"):
+              os.environ.pop(k, None)
+          os.environ["HF_TOKEN"] = "hf_OPERATOR_CANARY"
+          apply_token_to_child_env(os.environ, False)
+          import importlib
+          importlib.reload(huggingface_hub.constants)
+          from huggingface_hub.utils import build_hf_headers
+          hdr = build_hf_headers().get("authorization")
+          if hdr is not None:
+              fails.append(f"implicit token still attached after the scrub: {hdr}")
+
+          print("huggingface_hub", huggingface_hub.__version__, "| implicit header after scrub:", hdr)
+          if fails:
+              print("FAILURES:"); [print("  -", f) for f in fails]; raise SystemExit(1)
+          print("OK: token policy is identical on this OS")
+          PY
+
+      - name: Export routes carry no OS branch
+        shell: bash
+        working-directory: studio/backend
+        run: |
+          python - <<'PY'
+          import ast, pathlib, sys
+          bad = []
+          for f in ("routes/export.py", "core/export/orchestrator.py",
+                    "routes/data_recipe/jobs.py"):
+              src = pathlib.Path(f).read_text()
+              for n in ast.walk(ast.parse(src)):
+                  if isinstance(n, ast.Attribute) and n.attr == "platform":
+                      bad.append(f"{f}:{n.lineno} sys.platform branch")
+          # export.py legitimately branches on _IS_MLX; assert both arms are symmetric
+          src = pathlib.Path("core/export/export.py").read_text()
+          if src.count("**merged_token_kw") != 2:
+              bad.append("the MLX and non-MLX merged saves are not both given the token kwarg")
+          if bad:
+              print("FAILURES:"); [print("  -", b) for b in bad]; sys.exit(1)
+          print("OK: no OS routing added; MLX and non-MLX merged saves are symmetric")
+          PY
