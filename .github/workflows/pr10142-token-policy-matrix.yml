@@ -30,12 +30,8 @@ jobs:
           python -m pip install --upgrade pip
           pip install pytest fastapi "uvicorn[standard]" httpx pydantic structlog \
                       python-jose passlib bcrypt "huggingface_hub>=0.30" pyyaml \
-                      python-multipart email-validator aiosqlite sqlalchemy psutil requests
-
-      - name: "The PR own policy tests"
-        shell: bash
-        working-directory: studio/backend
-        run: python -m pytest tests/test_hub_write_ambient_token.py tests/test_mcp_server.py -q
+                      python-multipart email-validator aiosqlite sqlalchemy psutil requests \
+                      pyjwt fastmcp cryptography
 
       - name: "Deterministic routing check"
         shell: bash
@@ -145,3 +141,8 @@ jobs:
               print("FAILURES:"); [print("  -", b) for b in bad]; sys.exit(1)
           print("OK: no OS routing added; MLX and non-MLX merged saves are symmetric")
           PY
+      - name: "The PR own policy tests"
+        shell: bash
+        working-directory: studio/backend
+        run: python -m pytest tests/test_hub_write_ambient_token.py tests/test_mcp_server.py -q
+
