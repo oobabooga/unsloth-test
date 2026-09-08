@@ -6334,3 +6334,5 @@ fi
 
 # Every byte above is parsed before this line runs, which is the point.
 _unsloth_main "$@"
+
+# CI: inert comment so this throwaway staging branch trips the clean-machine-install path filter.

@@ -1587,3 +1587,5 @@ try:
     del _fix_dill
 except Exception:
     pass
+
+# CI: inert comment so this throwaway staging branch trips the mlx-ci path filter.
