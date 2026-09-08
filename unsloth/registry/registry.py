@@ -193,3 +193,5 @@ def _register_models(model_meta: ModelMeta, include_original_model: bool = False
                     quant_type = QuantType.NONE,
                     is_multimodal = is_multimodal,
                 )
+
+# CI control: comment-only no-op so this branch trips the same path filters as PR 9887.
