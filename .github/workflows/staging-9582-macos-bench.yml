@@ -1,0 +1,21 @@
+name: "staging-9582 macos bench-only"
+on:
+  push:
+    branches: ["pr-9582-xplat-ci"]
+concurrency:
+  group: bench-macos-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  test:
+    runs-on: macos-15
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: python -m pip install pytest
+      - name: The PR's own tests only
+        run: python -m pytest tests/studio/studiobench/report/selftest/test_studiobench_payload_sections.py -v --tb=short
+      - name: The whole studiobench report layer
+        run: python -m pytest tests/studio/studiobench/report tests/studio/studiobench/scoring -q --tb=short
