@@ -1,0 +1,51 @@
+name: "s10506 macos-15"
+on:
+  push:
+    branches: ["pr-10506-studio-ci"]
+  workflow_dispatch:
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+permissions:
+  contents: read
+defaults:
+  run:
+    shell: bash
+jobs:
+  studio:
+    runs-on: macos-15
+    timeout-minutes: 25
+    env:
+      UNSLOTH_COMPILE_DISABLE: '1'
+      UNSLOTH_IS_PRESENT: '1'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: deps
+        run: python -m pip install -q pytest pytest-timeout packaging
+      - name: routing matrix (native platform detection)
+        run: python tests/staging/routing_matrix_10506.py
+      - name: torchcodec compat suite
+        run: python -m pytest tests/python/test_torchcodec_torch_compat.py -q --timeout=300
+      - name: studio installer suite
+        run: python -m pytest tests/studio/install/ -q --timeout=900
+      - name: apple silicon + MLX routing
+        run: |
+          python -c "
+          import platform, sys
+          sys.path.insert(0, 'studio'); sys.path.insert(0, 'studio/backend')
+          import install_python_stack as ips
+          print('machine', platform.machine(), 'IS_MAC_ARM', ips.IS_MAC_ARM, 'IS_MACOS', ips.IS_MACOS)
+          print('macos major', ips._macos_release_major())
+          print('platform floor', ips._torchcodec_platform_floor())
+          assert ips.IS_MAC_ARM, 'expected an arm64 macOS runner'
+          assert not ips.PLATFORM_LACKS_TORCHCODEC_WHEEL
+          assert ips._select_torchcodec_spec('2.4.0') is None
+          assert ips._select_torchcodec_spec('2.11.0') is not None
+          print('OK')
+          "
+          python -m pip install -q mlx 2>/dev/null && python -c "import mlx.core as mx; print('mlx ok', mx.metal.is_available() if hasattr(mx,'metal') else 'n/a')" || echo "mlx not installable on this runner (informational)"
