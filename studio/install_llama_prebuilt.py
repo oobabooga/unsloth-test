@@ -4231,6 +4231,55 @@ def unique_install_side_path(install_dir: Path, label: str) -> Path:
     return candidate
 
 
+def _confirmed_reparse_point(path: Path) -> bool:
+    """Whether ``path`` is *known* to redirect elsewhere.
+
+    Not ``_is_link_or_junction``, which answers True when it cannot probe: ACLs bad
+    enough to deny ``lstat`` are the case the WinError 5 hint exists for, so an
+    unprobeable path must keep the repair rather than be read as a link.
+    """
+    try:
+        if os.name == "nt":
+            attributes = getattr(path.lstat(), "st_file_attributes", 0)
+            return bool(attributes & stat.FILE_ATTRIBUTE_REPARSE_POINT)
+        return path.is_symlink()
+    except OSError:
+        return False
+
+
+def blocked_replace_hint(winerror: object, path: Path) -> str:
+    """Why a replace was blocked, chosen by the error Windows actually returned.
+
+    32 is a held handle and 145 is ERROR_DIR_NOT_EMPTY. 5 is both: Defender and
+    the indexer report it (``activate_staged_dir``, ``is_busy_lock_error``) and so
+    do broken ACLs (#9928), so it names both causes and carries the repair for the
+    second. Printed, never run.
+    """
+    if winerror == 5:
+        lead = (
+            "access is denied -- usually a scanner, indexer or running process still "
+            "holding a handle, which clears on its own. If the retries do not clear it, "
+        )
+        antivirus = "Antivirus or Controlled folder access can deny it too"
+        if _confirmed_reparse_point(path):
+            # takeown /R walks through a linked root and icacls resolves one without
+            # /L, so the repair would rewrite a --with-llama-cpp-dir tree we do not own.
+            return (
+                f"{lead}the permissions are broken on {path} or on what it links to. That "
+                f"tree is not managed here, so repair it at the source. {antivirus}"
+            )
+        return (
+            f"{lead}this tree's permissions are broken; in an elevated PowerShell, run "
+            "each command:\n"
+            f'takeown /F "{path}" /R /D Y\n'
+            f'icacls "{path}" /reset /T\n'
+            f"{antivirus}"
+        )
+    if winerror == 145:
+        return "the directory is not empty yet -- an earlier copy is still being removed"
+    return "a scanner is likely still holding the install open"
+
+
 def replace_with_busy_retry(
     src: Path,
     dst: Path,
@@ -4239,8 +4288,9 @@ def replace_with_busy_retry(
 ) -> None:
     """``os.replace``, retried against transient Windows sharing violations.
 
-    WinError 5/32/145 means a scanner still holds a handle inside the tree,
-    which clears in a second or two; without a backoff that turns an update
+    WinError 5/32/145 blocks the rename and usually clears in a second or two,
+    but the cause differs per code, so the retry line says which (see
+    ``blocked_replace_hint``). Without a backoff that turns an update
     into a failure, and on the aside-move of the *existing* install that is the
     failure this installer most needs to avoid. Mirrors the Node installer's
     ``_replace_with_retry``. Other errors raise at once, and POSIX never
@@ -4258,9 +4308,10 @@ def replace_with_busy_retry(
             transient = os.name == "nt" and getattr(exc, "winerror", None) in (5, 32, 145)
             if not transient or attempt == attempts - 1:
                 raise
+            # src, not dst: the aside-move's dst is a rollback path that does not exist yet.
             log(
                 f"rename {src.name} -> {dst.name} blocked ({exc.winerror}), retrying in "
-                f"{delay:.2f}s -- a scanner is likely still holding the install open"
+                f"{delay:.2f}s -- {blocked_replace_hint(exc.winerror, src)}"
             )
             time.sleep(delay)
             delay = min(delay * 2, 4.0)
