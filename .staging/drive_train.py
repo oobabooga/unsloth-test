@@ -7,7 +7,7 @@ from core.training.worker import run_training_process
 out = os.path.expanduser(f"~/.unsloth/studio/outputs/staging-11851-{int(time.time())}")
 req = TrainingStartRequest(model_name=model, training_type="LoRA/QLoRA", format_type="auto",
     local_datasets=[data], eval_steps=0.5, max_steps=4, batch_size=1, gradient_accumulation_steps=1,
-    max_seq_length=512, is_dataset_image=True, load_in_4bit=True, save_steps=0, vision_image_size=224)
+    max_seq_length=512, is_dataset_image=True, load_in_4bit=True, save_steps=0, vision_image_size=256)
 cfg = req.model_dump()
 cfg.update(dict(hf_token="", allow_ambient=True, optim="adamw_8bit", output_dir=out,
     gradient_checkpointing="unsloth", subject="staging", resolved_gpu_ids=None,
