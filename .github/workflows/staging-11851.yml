@@ -36,8 +36,10 @@ jobs:
       - name: Split parity (list vs Dataset)
         working-directory: studio/backend
         continue-on-error: ${{ github.ref_name == 'pr-11851-control-ci' }}
+        env: { PYTHONPATH: '.' }
         run: python ../../.staging/split_parity.py
       - name: Eval split + training preflight + MLX worker config tests
+        if: ${{ !cancelled() }}
         working-directory: studio/backend
         run: |
           python -m pytest -q -p no:cacheprovider --timeout 600 \
